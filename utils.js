@@ -50,8 +50,3 @@ export async function InstallGlobalCommands(appId, commands) {
     console.error(err);
   }
 }
-
-
-export function capitalize(str) {
-  return str.charAt(0).toUpperCase() + str.slice(1);
-}
