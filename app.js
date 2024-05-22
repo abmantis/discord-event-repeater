@@ -1,35 +1,21 @@
-import "dotenv/config";
-import express from "express";
 import {
-  InteractionType,
-  InteractionResponseType,
-  InteractionResponseFlags,
-  MessageComponentTypes,
-  ButtonStyleTypes,
-} from "discord-interactions";
-import { VerifyDiscordRequest, DiscordRequest } from "./utils.js";
-import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  CDN,
   Client,
+  Collection,
+  CommandInteraction,
+  ComponentType,
   Events,
   GatewayIntentBits,
-  SlashCommandBuilder,
+  GuildScheduledEvent,
   GuildScheduledEventManager,
-  GuildScheduledEventPrivacyLevel,
-  GuildScheduledEventEntityType,
-  CDN, GuildScheduledEvent,
+  GuildScheduledEventStatus,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
 } from "discord.js";
 
-
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-const EVENT_START_HOURLY = 3600000;
-const EVENT_START_DAILY = 86400000;
-const EVENT_START_WEEKLY = 604800000;
-const EVENT_START_MONTHLY = 2628000000;
-
-// Parse request body and verifies incoming requests using discord-interactions package
-app.use(express.json({ verify: VerifyDiscordRequest(process.env.PUBLIC_KEY) }));
 
 const client = new Client({
   intents: [
@@ -43,72 +29,147 @@ client.login().then(r => console.log("login success")).catch(e => {
   console.error(e);
 });
 
-client.on("guildScheduledEventCreate", async (m) => {
+client.on(Events.GuildScheduledEventCreate, async (m) => {
   console.log("scheduled event created");
-  console.log(m);
 });
 
-client.on("guildScheduledEventUpdate", async (before, after) => {
-  console.log("scheduled event updated");
-  console.log(before.name);
-  console.log(after);
+client.on(Events.GuildScheduledEventUpdate, async (before, after) => {
+  console.log(`scheduled event ${before.name} updated`);
 
-  //check for indluded words to trigger different events
-  /* Scheduled = 1, Active = 2,Completed = 3, Canceled = 4 */
+  const EVENT_START_HOURLY = 3600000;
+  const EVENT_START_DAILY = 86400000;
+  const EVENT_START_WEEKLY = 604800000;
+  const EVENT_START_MONTHLY = 2628000000;
 
-  //trigger on ending an event, if the description includes "daily"
-  if ( before.status === 2 && after.status === 3) {
-    if(before.description.includes("[hourly]")) {
-      setupEvent(before, after, EVENT_START_HOURLY)
+  if (before.status === GuildScheduledEventStatus.Active
+    && after.status === GuildScheduledEventStatus.Completed) {
+    if (before.description.includes("[hourly]")) {
+      setupEvent(before, EVENT_START_HOURLY)
     } else if (before.description.includes("[daily]")) {
-      setupEvent(before, after, EVENT_START_DAILY)
+      setupEvent(before, EVENT_START_DAILY)
     } else if (before.description.includes("[weekly]")) {
-      setupEvent(before, after, EVENT_START_WEEKLY)
+      setupEvent(before, EVENT_START_WEEKLY)
     } else if (before.description.includes("[monthly]")) {
-      setupEvent(before, after, EVENT_START_MONTHLY)
+      setupEvent(before, EVENT_START_MONTHLY)
     }
   }
 });
 
-client.on("guildScheduledEventDelete", async (m) => {
+client.on(Events.GuildScheduledEventDelete, async (m) => {
   console.log("scheduled event deleted");
-  console.log(m);
 });
 
-app.post("/interactions", async function (req, res) {
-  const { type, id, data } = req.body;
+client.on(Events.InteractionCreate, async interaction => {
+  if (!interaction.isCommand()) return;
 
-  if (type === InteractionType.PING) {
-    return res.send({ type: InteractionResponseType.PONG });
-  }
+  const name = interaction.commandName;
 
-  if (type === InteractionType.APPLICATION_COMMAND) {
-    const { name } = data;
-
-    if (name === "help") {
-      // Send a message into the channel where command was triggered from
-      return res.send({
-        type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-        data: {
-          content:
-            "Hi! I'm the event repeater bot. Simply add `[hourly]`, `[daily]`, `[weekly]`, or `[monthly]` to your events description, and I'll create a follow-up event as soon as the event ends.",
-        },
-      });
-    }   
+  if (name === 'help') {
+    await interaction.reply({
+      content: "Hi! I'm the event repeater bot. Simply add `[hourly]`, `[daily]`, `[weekly]`, or `[monthly]` to your events description, and I'll create a follow-up event as soon as the event ends.",
+      ephemeral: true
+    });
+  } else if (name === 'ping-event') {
+    handlePingEventCommand(interaction);
   }
 });
 
-app.listen(PORT, () => {
-  console.log("Listening on port", PORT);
-});
+/**
+ * @param {CommandInteraction} interaction
+ */
+async function handlePingEventCommand(interaction) {
+  const pingMessage = interaction.options.getString('message');
 
+  const events = await getEvents(interaction.guildId);
 
-async function setupEvent(before, after, timeOffset) {
+  if (events.size === 0) {
+    await interaction.reply({
+      content: 'No events found.',
+      ephemeral: true
+    });
+    return;
+  }
+
+  const selectOptions = events.map((event, snowflake) => {
+    return new StringSelectMenuOptionBuilder()
+      .setLabel(event.name)
+      .setValue(snowflake);
+  });
+
+  const eventSelectMenu = new StringSelectMenuBuilder()
+    .setCustomId('select')
+    .setPlaceholder('Nothing selected')
+    .addOptions(selectOptions);
+  const response = await interaction.reply({
+    content: 'Which event to ping?',
+    components: [new ActionRowBuilder().addComponents(eventSelectMenu)],
+    ephemeral: true
+  });
+
+  try {
+    const collectedEventSelect = await response.awaitMessageComponent({
+      componentType: ComponentType.StringSelect,
+    });
+
+    const selectedEventSnowflake = collectedEventSelect.values[0];
+    const selectedEvent = events.get(selectedEventSnowflake);
+
+    const confirmButton = new ButtonBuilder()
+      .setCustomId('confirm')
+      .setLabel('Ping!')
+      .setStyle(ButtonStyle.Danger);
+
+    const cancelButton = new ButtonBuilder()
+      .setCustomId('cancel')
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary);
+
+    await collectedEventSelect.update({
+      content: `Will ping everyone in **"${selectedEvent.name}"**, with:\n\`\`\`\n${pingMessage}\n\`\`\``,
+      components: [new ActionRowBuilder().addComponents(cancelButton, confirmButton)],
+    });
+
+    const collectedConfirmButton = await response.awaitMessageComponent({
+      componentType: ComponentType.Button,
+    });
+
+    if (collectedConfirmButton.customId !== 'confirm') {
+      await collectedConfirmButton.update({ content: "Ping canceled.", components: [] });
+      return;
+    }
+
+    await collectedConfirmButton.update({ content: "Will ping now.", components: [] });
+
+    const subscribers = await selectedEvent.fetchSubscribers({ withMember: false });
+    const subscriberUsers = subscribers.map(user => {
+      return `${user.user}`;
+    }).join(" ");
+
+    await collectedConfirmButton.followUp({ content: `${pingMessage}\n\n${subscriberUsers}` });
+
+  } catch (e) {
+    await interaction.editReply({
+      content: 'Interaction timeout.',
+      components: [],
+      ephemeral: true
+    });
+  }
+}
+
+/**
+ * @returns {Promise<Collection<import("discord.js").Snowflake, GuildScheduledEvent>>}
+ */
+async function getEvents(guildId) {
+  const guild = await client.guilds.fetch(guildId);
+  const eventManager = new GuildScheduledEventManager(guild);
+  return await eventManager.fetch();
+}
+
+async function setupEvent(before, timeOffset) {
   console.log("Setting up event")
   const guild = await client.guilds.fetch(before.guildId);
-  //const channel = await client.channels.fetch(before.channelId);
   const cdn = new CDN();
-  const imageLink = cdn.guildScheduledEventCover(before.id, before.image, {size: 4096,});
+  const imageLink = cdn.guildScheduledEventCover(before.id, before.image, { size: 4096, });
 
   const event_manager = new GuildScheduledEventManager(guild);
   await event_manager.create({
@@ -116,7 +177,6 @@ async function setupEvent(before, after, timeOffset) {
     description: before.description,
     scheduledStartTime: before.scheduledStartTimestamp + timeOffset,
     scheduledEndTime: before.scheduledEndTimestamp + timeOffset,
-    //channel: channel,
     entityMetadata: before.entityMetadata,
     privacyLevel: 2,
     entityType: 3,
